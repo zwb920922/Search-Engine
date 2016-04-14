@@ -3,7 +3,6 @@
  *  Copyright (c) 2016, Carnegie Mellon University.  All Rights Reserved.
  */
 import java.io.*;
-import java.util.*;
 
 import org.apache.lucene.document.Document;
 import org.apache.lucene.index.*;
@@ -101,7 +100,7 @@ public class Idx {
     ScoreDoc[] hits = collector.topDocs().scoreDocs;
 
     if (hits.length < 1) {
-      throw new Exception("External id not found.");
+      return -1;
     } else {
       return hits[0].doc;
     }

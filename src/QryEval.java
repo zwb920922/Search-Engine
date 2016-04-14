@@ -12,8 +12,10 @@ import org.apache.lucene.analysis.TokenStream;
 import org.apache.lucene.analysis.tokenattributes.CharTermAttribute;
 import org.apache.lucene.document.Document;
 import org.apache.lucene.index.*;
+import org.apache.lucene.queryparser.flexible.core.util.StringUtils;
 import org.apache.lucene.search.*;
 import org.apache.lucene.store.FSDirectory;
+import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.Version;
 
 /**
@@ -94,8 +96,23 @@ public class QryEval {
     RetrievalModel model = initializeRetrievalModel(parameters);
 
     // Perform experiments.
-
-    processQueryFile(parameters, model);
+    if (model instanceof RetrievalModelLetor) {
+      // create feature vectors
+      processLetor(parameters, model, true);
+      // train the model
+      train(parameters);
+      // run BM25 to create initial ranking
+      double k_1 = Double.parseDouble(parameters.get("BM25:k_1"));
+      double b = Double.parseDouble(parameters.get("BM25:b"));
+      double k_3 = Double.parseDouble(parameters.get("BM25:k_3"));
+      processQueryFile(parameters, new RetrievalModelBM25(k_1, b, k_3));
+      // generate feature vectors for initial ranking files and queries
+      processLetor(parameters, model, false);
+      // create scores for test
+      createScoresForTest(parameters);
+      rerank(parameters);
+    } else
+      processQueryFile(parameters, model);
 
     // Clean up.
 
@@ -129,6 +146,8 @@ public class QryEval {
       double mu = Double.parseDouble(parameters.get("Indri:mu"));
       double lambda = Double.parseDouble(parameters.get("Indri:lambda"));
       model = new RetrievalModelIndri(mu, lambda);
+    } else if (modelString.equals("letor")) {
+      model = new RetrievalModelLetor();
     } else {
       throw new IllegalArgumentException("Unknown retrieval model " + parameters.get("retrievalAlgorithm"));
     }
@@ -415,7 +434,7 @@ public class QryEval {
    * 
    * @param queryFilePath
    * @param model
-   * @throws Exception 
+   * @throws Exception
    */
   static void processQueryFile(Map<String, String> parameters, RetrievalModel model) throws Exception {
 
@@ -429,7 +448,7 @@ public class QryEval {
       String qLine = null;
 
       input = new BufferedReader(new FileReader(queryFilePath));
-      
+
       // for expansion
       boolean fb = "true".equals(parameters.get("fb"));
       String fbInitialRankingFile = parameters.get("fbInitialRankingFile");
@@ -472,9 +491,9 @@ public class QryEval {
           writeExpandedQuery(qid, expandedQuery, expansionQueryWriter);
           query = mergeQuery(query, expandedQuery, parameters);
         }
-        
+
         System.out.println(query);
-        
+
         r = processQuery(query, model, parameters);
 
         if (r != null) {
@@ -485,7 +504,8 @@ public class QryEval {
     } catch (IOException ex) {
       ex.printStackTrace();
     } finally {
-      input.close();
+      if (input != null)
+        input.close();
       writer.close();
       if (expansionQueryWriter != null)
         expansionQueryWriter.close();
@@ -545,7 +565,8 @@ public class QryEval {
     do {
       line = scan.nextLine();
       String[] pair = line.split("=");
-      parameters.put(pair[0].trim(), pair[1].trim());
+      if (pair.length == 2)
+        parameters.put(pair[0].trim(), pair[1].trim());
     } while (scan.hasNext());
 
     scan.close();
@@ -633,10 +654,10 @@ public class QryEval {
     } catch (IOException ex) {
       ex.printStackTrace();
     } finally {
-      
-      input.close();
+      if (input != null)
+        input.close();
     }
-    //System.out.println(ret.size());
+    // System.out.println(ret.size());
     return ret;
   }
 
@@ -673,16 +694,19 @@ public class QryEval {
         return cmp > 0 ? 1 : -1;
     }
   }
-  
-/**
- * get the expanded query.
- * @param qid query id
- * @param initialRanking 
- * @param parameters
- * @return 
- * @throws Exception
- */
-  private static String getExpandedQuery(String qid, Map<String,ArrayList<ID_Score_Pair>> initialRanking, Map<String, String> parameters) throws Exception {
+
+  /**
+   * get the expanded query.
+   * 
+   * @param qid
+   *          query id
+   * @param initialRanking
+   * @param parameters
+   * @return
+   * @throws Exception
+   */
+  private static String getExpandedQuery(String qid, Map<String, ArrayList<ID_Score_Pair>> initialRanking,
+      Map<String, String> parameters) throws Exception {
     ArrayList<ID_Score_Pair> ranking = initialRanking.get(qid);
     int fbTerms = Integer.parseInt(parameters.get("fbTerms"));
     int fbDocs = Integer.parseInt(parameters.get("fbDocs"));
@@ -692,7 +716,7 @@ public class QryEval {
     ID_Score_Pair[] pairs = new ID_Score_Pair[fbDocs];
     String field = "body"; // assume that.
     // gather all the candidates terms.
-    for (int i = 0; i < fbDocs; i++) {
+    for (int i = 0; i < fbDocs && i < pairs.length; i++) {
       pairs[i] = ranking.get(i);
       int internalID = pairs[i].getID();
       t[i] = new TermVector(internalID, field);
@@ -706,18 +730,18 @@ public class QryEval {
     // calculate scores for these candidates
     PriorityQueue<Term_Score_Pair> queue = new PriorityQueue<>(new PairComparatorForTermAndScore());
     double corpLen = Idx.getSumOfFieldLengths(field);
-    for (String term: candidateTerms) {
+    for (String term : candidateTerms) {
       double score = 0;
-      //System.out.println(term);
-      double ctf = Idx.INDEXREADER.totalTermFreq(new Term(field,  term));
+      // System.out.println(term);
+      double ctf = Idx.INDEXREADER.totalTermFreq(new Term(field, term));
       for (int i = 0; i < fbDocs; i++) {
         double docScore = pairs[i].getScore();
         double tf = 0;
         int index = t[i].indexOfStem(term);
         if (index != -1) {
           tf = t[i].stemFreq(index);
-//          if (t[i].totalStemFreq(index) != ctf)
-//            throw new IllegalStateException();
+          // if (t[i].totalStemFreq(index) != ctf)
+          // throw new IllegalStateException();
         }
         double docLen = t[i].positionsLength();
         score += docScore * (tf + fbMu * ctf / corpLen) / (docLen + fbMu);
@@ -736,6 +760,7 @@ public class QryEval {
     ret.append(" )");
     return ret.toString();
   }
+
   /**
    * 
    * pair of candidate term and score
@@ -758,6 +783,7 @@ public class QryEval {
       return score;
     }
   }
+
   /**
    * 
    * comparator for Term_Score_Pair.
@@ -774,8 +800,10 @@ public class QryEval {
       }
     }
   }
+
   /**
    * merge the original and expanded query.
+   * 
    * @param query
    * @param expandedQuery
    * @param parameters
@@ -786,8 +814,9 @@ public class QryEval {
     return "#wand (" + w + " #and(" + query + ") " + (1.0 - w) + " " + expandedQuery + ")";
   }
 
-  private static ArrayList<ID_Score_Pair> getRanking(String qString, RetrievalModel model, Map<String, String> parameters) throws IOException {
-    
+  private static ArrayList<ID_Score_Pair> getRanking(String qString, RetrievalModel model,
+      Map<String, String> parameters) throws IOException {
+
     Qry q = parseQuery(qString, model, parameters);
     // System.out.println(q);
     q = optimizeQuery(q);
@@ -797,7 +826,7 @@ public class QryEval {
     System.out.println("    --> " + q);
 
     if (q != null) {
-      
+
       ArrayList<ID_Score_Pair> ret = new ArrayList<>();
       PriorityQueue<ID_Score_Pair> queue = new PriorityQueue<>(new PairComparatorForIDAndScore());
 
@@ -806,7 +835,7 @@ public class QryEval {
       if (q.args.size() > 0) { // Ignore empty queries
 
         q.initialize(model);
-        
+
         while (q.docIteratorHasMatch(model)) {
           int docid = q.docIteratorGetMatch();
           double score = ((QrySop) q).getScore(model);
@@ -823,9 +852,519 @@ public class QryEval {
     } else
       return null;
   }
-  
+
   private static void writeExpandedQuery(String qid, String expandedQuery, PrintWriter outputFile) {
     outputFile.println(qid + ": " + expandedQuery);
   }
-  
+
+  private static void processLetor(Map<String, String> parameters, RetrievalModel model, boolean training)
+      throws Exception {
+
+    PrintWriter featureVectorsFileWriter = null;
+    BufferedReader trainingQuery = null;
+    // qid -> FeatureVectors
+    Map<String, FeatureVectors> fvMap = null;
+
+    try {
+      // read relevant document judgements
+      Map<String, List<RelevantDoc>> relDocsMap;
+      if (training) {
+        relDocsMap = readQrelsFile(parameters);
+      } else {
+        relDocsMap = readInitialRankingFile(parameters);
+      }
+
+      // read page rank documents
+      Map<String, Double> pageRanksMap = readPageRanks(parameters);
+
+      // generate training data
+      String trainingQueryFile;
+      if (training)
+        trainingQueryFile = parameters.get("letor:trainingQueryFile");
+      else
+        trainingQueryFile = parameters.get("queryFilePath");
+      String qLine = null;
+      trainingQuery = new BufferedReader(new FileReader(trainingQueryFile));
+      // qid -> FeatureVectors
+      fvMap = new HashMap<>();
+
+      while ((qLine = trainingQuery.readLine()) != null) {
+        int d = qLine.indexOf(':');
+        if (d < 0) {
+          throw new IllegalArgumentException("Syntax error:  Missing ':' in query line.");
+        }
+
+        printMemoryUsage(false);
+
+        String qid = qLine.substring(0, d);
+        String query = qLine.substring(d + 1);
+        String[] terms = tokenizeQuery(query);
+        // System.out.println(Arrays.toString(terms));
+
+        System.out.println("Query " + qLine);
+
+        List<RelevantDoc> relDocs = relDocsMap.get(qid);
+        if (relDocs == null)
+          throw new Exception("qid: " + qid);
+        FeatureVectors FV = new FeatureVectors(qid);
+        fvMap.put(qid, FV);
+        for (RelevantDoc rd : relDocs) {
+          String docid = rd.docid;
+          int relDegree = rd.relDegree;
+          int internalid = Idx.getInternalDocid(docid);
+          // not in our index.
+          if (internalid == -1)
+            continue;
+          FV.addDoc(docid);
+          // store relevance degree
+          FV.setFeatureValue(docid, 0, (double) relDegree);
+          // store spam score 1
+          double spamScore = Integer.parseInt(Idx.getAttribute("score", internalid));
+          FV.setFeatureValue(docid, 1, spamScore);
+          // store url depth 2
+          String rawUrl = Idx.getAttribute("rawUrl", internalid);
+          int count = 0;
+          int urlLength = rawUrl.length();
+          for (int i = 0; i < urlLength; i++) {
+            if (rawUrl.charAt(i) == '/')
+              count++;
+          }
+          // System.out.println(rawUrl + ": " + count);
+          FV.setFeatureValue(docid, 2, (double) count);
+          // store Wikipedia score 3
+          if (rawUrl.contains("wikipedia.org")) {
+            FV.setFeatureValue(docid, 3, 1.0);
+          } else {
+            FV.setFeatureValue(docid, 3, 0.0);
+          }
+          // store page rank 4
+          FV.setFeatureValue(docid, 4, pageRanksMap.get(docid));
+          // unique terms percentage in this doc 17
+          TermVector tmp = new TermVector(internalid, "body");
+          FV.setFeatureValue(docid, 17, ((double) tmp.stemsLength()) / tmp.positionsLength());
+          // calculate BM25, Indri and term overlap scores
+          for (int i = 0; i < 4; i++) {
+            String field = TEXT_FIELDS[i];
+            TermVector termVector = new TermVector(internalid, field);
+            if (termVector.positionsLength() != 0) {
+              double BM25Score = getBM25Score(terms, internalid, termVector, parameters);
+              FV.setFeatureValue(docid, 3 * i + 5, BM25Score);
+              double indriScore = getIndriScore(terms, internalid, termVector, parameters);
+              FV.setFeatureValue(docid, 3 * i + 6, indriScore);
+              double overlapScore = getOverlapScore(terms, termVector);
+              FV.setFeatureValue(docid, 3 * i + 7, overlapScore);
+              if (i == 0) {
+                double overlapScore2 = getOverlapScoreInDoc(terms, termVector);
+                FV.setFeatureValue(docid, 18, overlapScore2);
+              }
+            } else {
+              // System.out.println(docid);
+              FV.setFeatureValue(docid, 3 * i + 5, null);
+              FV.setFeatureValue(docid, 3 * i + 6, null);
+              FV.setFeatureValue(docid, 3 * i + 7, null);
+            }
+          }
+          // ~~~~~~~ 17 18 feature to be implemented ~~~~~~~~~
+        }
+        // normalize feature values
+        normalize(FV);
+
+      }
+
+      // disabled features
+      Set<Integer> disabled = new HashSet<>();
+      String fd = parameters.get("letor:featureDisable");
+      if (fd != null) {
+        String[] numbers = fd.trim().split(",");
+        for (String number : numbers)
+          disabled.add(Integer.parseInt(number));
+      }
+
+      ArrayList<String> qids = new ArrayList<>(fvMap.keySet());
+      Collections.sort(qids);
+      if (training)
+        featureVectorsFileWriter = new PrintWriter(parameters.get("letor:trainingFeatureVectorsFile"), "UTF8");
+      else
+        featureVectorsFileWriter = new PrintWriter(parameters.get("letor:testingFeatureVectorsFile"), "UTF8");
+      for (String qid : qids) {
+        FeatureVectors fv = fvMap.get(qid);
+        Iterable<String> docids = fv.docids();
+        for (String docid : docids) {
+          featureVectorsFileWriter.print(fv.getValue(docid, 0) + " qid:" + fv.getQid() + " ");
+          for (int i = 1; i < 19; i++) {
+            if (disabled.contains(i))
+              continue;
+            featureVectorsFileWriter.print(i + ":" + fv.getValue(docid, i) + " ");
+          }
+          featureVectorsFileWriter.print("# " + docid + "\n");
+        }
+      }
+    } catch (IOException ex) {
+      ex.printStackTrace();
+    } finally {
+      if (trainingQuery != null)
+        trainingQuery.close();
+      if (featureVectorsFileWriter != null)
+        featureVectorsFileWriter.close();
+    }
+
+  }
+
+  private static class RelevantDoc {
+    private String docid;
+    private int relDegree;
+
+    public RelevantDoc(String s, int i) {
+      docid = s;
+      relDegree = i;
+    }
+  }
+
+  private static void normalize(FeatureVectors fv) {
+    // initialize max and min values
+    double[] maxValue = new double[19];
+    double[] minValue = new double[19];
+    Arrays.fill(minValue, Double.POSITIVE_INFINITY);
+    Arrays.fill(maxValue, Double.NEGATIVE_INFINITY);
+    maxValue[0] = 2;
+    minValue[0] = 0;
+    Iterable<String> docids = fv.docids();
+    for (String docid : docids) {
+      for (int i = 1; i < 19; i++) {
+        Double tmp = fv.getValue(docid, i);
+        if (tmp == null)
+          continue;
+        if (tmp > maxValue[i])
+          maxValue[i] = tmp;
+        if (tmp < minValue[i])
+          minValue[i] = tmp;
+      }
+    }
+    // System.out.println(Arrays.toString(maxValue));
+    // System.out.println(Arrays.toString(minValue));
+    // normalization
+    for (String docid : docids) {
+      for (int i = 1; i < 19; i++) {
+        Double value = fv.getValue(docid, i);
+        double normalizedValue = value == null ? 0
+            : (maxValue[i] - minValue[i]) == 0 ? 0 : (value - minValue[i]) / ((maxValue[i] - minValue[i]));
+        fv.setFeatureValue(docid, i, normalizedValue);
+      }
+    }
+  }
+
+  private static double getBM25Score(String[] terms, int docid, TermVector termVector, Map<String, String> parameters)
+      throws IOException {
+
+    double score = 0;
+    double k_1 = Double.parseDouble(parameters.get("BM25:k_1"));
+    double b = Double.parseDouble(parameters.get("BM25:b"));
+    double k_3 = Double.parseDouble(parameters.get("BM25:k_3"));
+    double docLen = termVector.positionsLength();
+    double avg_docLen = ((double) Idx.getSumOfFieldLengths(termVector.fieldName))
+        / Idx.getDocCount(termVector.fieldName);
+
+    for (String term : terms) {
+      // calculate idf
+      int termIndex = termVector.indexOfStem(term);
+      if (termIndex == -1)
+        continue;
+      double df = termVector.stemDf(termIndex);
+      // double df = Idx.INDEXREADER.docFreq(new Term(term));
+      double numerator = Idx.getNumDocs() - df + 0.5;
+      double denominator = df + 0.5;
+      double idf = Math.max(0, Math.log(numerator / denominator));
+      // calculate tfWeight
+      double tf;
+      tf = termVector.stemFreq(termIndex);
+      double temp = tf + k_1 * ((1 - b) + b * docLen / avg_docLen);
+      double tfWeight = tf / temp;
+      // calculate userWeight
+      double qtf = 1; // not sure ?
+      double userWeight = (k_3 + 1) * qtf / (k_3 + qtf);
+      // if (Idx.getExternalDocid(docid).equals("clueweb09-en0000-95-28647"))
+      // System.out.println("BM25: " + term + ": tf " + tf + " docLen " +
+      // docLen);
+      score += idf * tfWeight * userWeight;
+    }
+
+    return score;
+  }
+
+  private static double getIndriScore(String[] terms, int docid, TermVector termVector, Map<String, String> parameters)
+      throws IOException {
+    // check whether there is one term in the doc, if no, return 0
+    boolean present = false;
+    for (String term : terms) {
+      int index = termVector.indexOfStem(term);
+      if (index != -1)
+        present = true;
+    }
+    if (!present)
+      return 0.0;
+    double score = 1.0;
+    double corpLen = Idx.getSumOfFieldLengths(termVector.fieldName);
+    double docLen = termVector.positionsLength();
+    double mu = Double.parseDouble(parameters.get("Indri:mu"));
+    double lambda = Double.parseDouble(parameters.get("Indri:lambda"));
+    double power = 1.0 / terms.length;
+    for (String term : terms) {
+      int index = termVector.indexOfStem(term);
+      double tf = index == -1 ? 0 : termVector.stemFreq(index);
+      double ctf = Idx.INDEXREADER.totalTermFreq(new Term(termVector.fieldName, new BytesRef(term)));
+      // if (Idx.getExternalDocid(docid).equals("clueweb09-en0000-95-28647"))
+      // System.out.println(termVector.fieldName + ": " + term + ": tf " + tf +
+      // " ctf " + ctf +
+      // " corpLen " + corpLen + " docLen " + docLen + " mu " + mu + " lambda "
+      // + lambda);
+      score *= Math.pow((1 - lambda) * ((tf + mu * ctf / corpLen) / (docLen + mu)) + lambda * ctf / corpLen, power);
+      // if (Idx.getExternalDocid(docid).equals("clueweb09-en0000-95-28647"))
+      // System.out.println("score: " + score);
+    }
+    return score;
+  }
+
+  private static double getOverlapScore(String[] terms, TermVector termVector) throws IOException {
+    double score = 0;
+    for (String term : terms) {
+      int index = termVector.indexOfStem(term);
+      if (index != -1)
+        score++;
+    }
+    return score / terms.length;
+  }
+
+  private static double getOverlapScoreInDoc(String[] terms, TermVector termVector) {
+    double count = 0;
+    for (String term : terms) {
+      int index = termVector.indexOfStem(term);
+      if (index != -1)
+        count += termVector.stemFreq(index);
+    }
+    return count / termVector.positionsLength();
+  }
+
+  private static Map<String, List<RelevantDoc>> readQrelsFile(Map<String, String> parameters)
+      throws NumberFormatException, IOException {
+    // read relevance judgements.
+    BufferedReader judgements = null;
+    Map<String, List<RelevantDoc>> relDocsMap = new HashMap<>();
+    try {
+      String qrelsFile = parameters.get("letor:trainingQrelsFile");
+      judgements = new BufferedReader(new FileReader(qrelsFile));
+      String rline = null;
+      while ((rline = judgements.readLine()) != null) {
+        String[] tokens = rline.split("\\s+");
+        if (tokens.length != 4)
+          throw new IllegalArgumentException(Arrays.toString(tokens));
+        String qid = tokens[0];
+        String docid = tokens[2];
+        int relDegree = Integer.parseInt(tokens[3]);
+        if (relDocsMap.get(qid) == null)
+          relDocsMap.put(qid, new ArrayList<RelevantDoc>());
+        relDocsMap.get(qid).add(new RelevantDoc(docid, relDegree));
+      }
+    } catch (Exception ex) {
+      ex.printStackTrace();
+    } finally {
+      if (judgements != null)
+        judgements.close();
+    }
+    return relDocsMap;
+  }
+
+  private static Map<String, List<RelevantDoc>> readInitialRankingFile(Map<String, String> parameters)
+      throws NumberFormatException, IOException {
+    // read relevance judgements.
+    BufferedReader initialRanking = null;
+    Map<String, List<RelevantDoc>> relDocsMap = new HashMap<>();
+    try {
+      String initialRankingFile = parameters.get("trecEvalOutputPath");
+      initialRanking = new BufferedReader(new FileReader(initialRankingFile));
+      String rline = null;
+      while ((rline = initialRanking.readLine()) != null) {
+        String[] tokens = rline.trim().split("\\s+");
+        if (tokens.length != 6)
+          throw new IllegalArgumentException("length: " + tokens.length + Arrays.toString(tokens));
+        String qid = tokens[0];
+        String docid = tokens[2];
+        if (relDocsMap.get(qid) == null)
+          relDocsMap.put(qid, new ArrayList<RelevantDoc>());
+        relDocsMap.get(qid).add(new RelevantDoc(docid, 0));
+      }
+    } catch (Exception ex) {
+      ex.printStackTrace();
+    } finally {
+      if (initialRanking != null)
+        initialRanking.close();
+    }
+    return relDocsMap;
+  }
+
+  private static Map<String, Double> readPageRanks(Map<String, String> parameters) throws IOException {
+    // read page rank documents
+    BufferedReader pageRanks = null;
+    Map<String, Double> pageRanksMap = new HashMap<>();
+    String pline = null;
+    try {
+      String pageRankFile = parameters.get("letor:pageRankFile");
+      pageRanks = new BufferedReader(new FileReader(pageRankFile));
+      while ((pline = pageRanks.readLine()) != null) {
+        String[] tokens = pline.split("\\s+");
+        if (tokens.length != 2)
+          throw new IllegalArgumentException();
+        String docid = tokens[0];
+        double docValue = Double.parseDouble(tokens[1]);
+        pageRanksMap.put(docid, docValue);
+      }
+    } catch (Exception e) {
+      e.printStackTrace();
+    } finally {
+      if (pageRanks != null)
+        pageRanks.close();
+    }
+    return pageRanksMap;
+  }
+
+  private static void train(Map<String, String> parameters) throws Exception {
+    // _______________________ train_____________________________
+    // runs svm_rank_learn from within Java to train the model
+    // execPath is the location of the svm_rank_learn utility,
+    // which is specified by letor:svmRankLearnPath in the parameter file.
+    // FEAT_GEN.c is the value of the letor:c parameter.
+    Process cmdProc = Runtime.getRuntime()
+        .exec(new String[] { parameters.get("letor:svmRankLearnPath"), "-c",
+            String.valueOf(parameters.get("letor:svmRankParamC")), parameters.get("letor:trainingFeatureVectorsFile"),
+            parameters.get("letor:svmRankModelFile") });
+
+    // The stdout/stderr consuming code MUST be included.
+    // It prevents the OS from running out of output buffer space and
+    // stalling.
+
+    // consume stdout and print it out for debugging purposes
+    BufferedReader stdoutReader = new BufferedReader(new InputStreamReader(cmdProc.getInputStream()));
+    String line;
+    while ((line = stdoutReader.readLine()) != null) {
+      System.out.println(line);
+    }
+    // consume stderr and print it for debugging purposes
+    BufferedReader stderrReader = new BufferedReader(new InputStreamReader(cmdProc.getErrorStream()));
+    while ((line = stderrReader.readLine()) != null) {
+      System.out.println(line);
+    }
+
+    // get the return value from the executable. 0 means success, non-zero
+    // indicates a problem
+    int retValue = cmdProc.waitFor();
+    if (retValue != 0) {
+      throw new Exception("SVM Rank crashed.");
+    }
+    // __________________________________________________________
+  }
+
+  private static void createScoresForTest(Map<String, String> parameters) throws Exception {
+    // _______________________ train_____________________________
+    // runs svm_rank_learn from within Java to train the model
+    // execPath is the location of the svm_rank_learn utility,
+    // which is specified by letor:svmRankLearnPath in the parameter file.
+    // FEAT_GEN.c is the value of the letor:c parameter.
+    Process cmdProc = Runtime.getRuntime()
+        .exec(new String[] { parameters.get("letor:svmRankClassifyPath"),
+            parameters.get("letor:testingFeatureVectorsFile"), parameters.get("letor:svmRankModelFile"),
+            parameters.get("letor:testingDocumentScores") });
+
+    // The stdout/stderr consuming code MUST be included.
+    // It prevents the OS from running out of output buffer space and
+    // stalling.
+
+    // consume stdout and print it out for debugging purposes
+    BufferedReader stdoutReader = new BufferedReader(new InputStreamReader(cmdProc.getInputStream()));
+    String line;
+    while ((line = stdoutReader.readLine()) != null) {
+      System.out.println(line);
+    }
+    // consume stderr and print it for debugging purposes
+    BufferedReader stderrReader = new BufferedReader(new InputStreamReader(cmdProc.getErrorStream()));
+    while ((line = stderrReader.readLine()) != null) {
+      System.out.println(line);
+    }
+
+    // get the return value from the executable. 0 means success, non-zero
+    // indicates a problem
+    int retValue = cmdProc.waitFor();
+    if (retValue != 0) {
+      throw new Exception("SVM Rank crashed.");
+    }
+    // __________________________________________________________
+  }
+
+  private static void rerank(Map<String, String> parameters) throws IOException {
+    BufferedReader initialRanking = null;
+    BufferedReader docScore = null;
+    LinkedHashMap<String, List<DocScore>> idsMap = new LinkedHashMap<>();
+    List<Double> scores = new ArrayList<>();
+    PrintWriter writer = null;
+    try {
+      String docScoreFile = parameters.get("letor:testingDocumentScores");
+      docScore = new BufferedReader(new FileReader(docScoreFile));
+      String sline = null;
+      while ((sline = docScore.readLine()) != null) {
+        scores.add(Double.parseDouble(sline));
+      }
+
+      int i = 0; // index of docScore list
+      String initialRankingFile = parameters.get("trecEvalOutputPath");
+      initialRanking = new BufferedReader(new FileReader(initialRankingFile));
+      String rline = null;
+      while ((rline = initialRanking.readLine()) != null) {
+        String[] tokens = rline.trim().split("\\s+");
+        if (tokens.length != 6)
+          throw new IllegalArgumentException("length: " + tokens.length + Arrays.toString(tokens));
+        String qid = tokens[0];
+        String docid = tokens[2];
+        if (idsMap.get(qid) == null)
+          idsMap.put(qid, new ArrayList<DocScore>());
+        List<DocScore> ids = idsMap.get(qid);
+        ids.add(new DocScore(docid, scores.get(i++)));
+      }
+      if (i != scores.size())
+        throw new IllegalStateException();
+
+      for (String qid : idsMap.keySet()) {
+        idsMap.get(qid)
+            .sort((DocScore d1, DocScore d2) -> (d1.score - d2.score == 0 ? 0 : d1.score - d2.score < 0 ? 1 : -1));
+      }
+
+      writer = new PrintWriter(parameters.get("trecEvalOutputPath"), "UTF8");
+      for (String qid : idsMap.keySet()) {
+        List<DocScore> scoreList = idsMap.get(qid);
+        int k = 0;
+        for (DocScore d : scoreList) {
+          writer.println("\t" + qid + "\t" + "Q0" + "\t" + d.id + "\t" + (++k) + "\t" + d.score + "\t" + "yubinletor");
+        }
+      }
+
+    } catch (Exception ex) {
+      ex.printStackTrace();
+    } finally {
+      if (initialRanking != null)
+        initialRanking.close();
+      if (docScore != null)
+        docScore.close();
+      if (writer != null)
+        writer.close();
+    }
+
+  }
+
+  private static class DocScore {
+    private String id;
+    private double score;
+
+    public DocScore(String i, double s) {
+      id = i;
+      score = s;
+    }
+  }
+
 }
